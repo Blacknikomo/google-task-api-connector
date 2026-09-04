@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   Google Tasks MCP connector for Claude.
-  API Gateway (HTTP API) -> Lambda (Node 20, Hono + MCP SDK) -> DynamoDB (tokens) + Secrets Manager (Google OAuth client).
+  API Gateway (HTTP API) -> Lambda (Node 24, Hono + MCP SDK) -> DynamoDB (tokens) + Secrets Manager (Google OAuth client).
 
 Parameters:
   GoogleOAuthSecretName:
@@ -20,7 +20,7 @@ Parameters:
 
 Globals:
   Function:
-    Runtime: nodejs20.x
+    Runtime: nodejs24.x
     Architectures: [arm64]
     Timeout: 29 # API Gateway HTTP API hard limit is 30s
     MemorySize: 512
@@ -58,11 +58,15 @@ Resources:
       BuildMethod: esbuild
       BuildProperties:
         Minify: true
-        Target: es2022
+        Target: node24
         Format: esm
         OutExtension: [".js=.mjs"]
-        Sourcemap: true
+        Sourcemap: false
         EntryPoints: [src/handler.ts]
+        # Prefer each dependency's ESM build. Without this esbuild resolves the
+        # AWS SDK's CJS dist, whose require() calls become a __require shim that
+        # throws `Dynamic require of "node:https" is not supported` at cold start.
+        MainFields: "module,main"
     Properties:
       Handler: handler.handler
       CodeUri: .

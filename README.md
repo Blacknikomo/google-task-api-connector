@@ -10,13 +10,13 @@ Status: skeleton — structure and typed stubs; API calls and OAuth token endpoi
 
 ## Stack
 
-TypeScript / Node 20 · Hono · `@modelcontextprotocol/sdk` (stateless Streamable HTTP) · AWS Lambda + API Gateway + DynamoDB via SAM · OAuth 2.1 with PKCE towards the client, Google OAuth towards the API.
+TypeScript / Node 24 · Hono · `@modelcontextprotocol/sdk` (stateless Streamable HTTP) · AWS Lambda + API Gateway + DynamoDB via SAM · OAuth 2.1 with PKCE towards the client, Google OAuth towards the API.
 
 ## Development
 
 ### Requirements
 
-- Node 20, AWS SAM CLI (for deploy).
+- Node 24, AWS SAM CLI (for deploy).
 - **External docs and ADR list must be connected.** Architecture notes and the ADR list live outside this repo, in an Obsidian vault (`Forest/Apps/google-task-api-connector`), and are not committed. Before changing anything architectural, make sure the vault folder is accessible:
   - Claude Code: `.claude/settings.local.json` must list the vault folder in `permissions.additionalDirectories` (not committed — recreate it, or run `/add-dir <vault path>` in the session). Verify with `ls <vault path>/ADR`.
   - Manually: open the folder in Obsidian.
