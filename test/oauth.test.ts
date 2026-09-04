@@ -119,6 +119,28 @@ describe("OAuth authorization server", () => {
     expect(body.refresh_token).toBeTruthy();
   });
 
+  it("serves protected-resource metadata at both RFC 9728 paths", async () => {
+    // Claude reads the bare path; other clients (ChatGPT) probe the resource-suffixed one.
+    for (const path of ["/.well-known/oauth-protected-resource", "/.well-known/oauth-protected-resource/mcp"]) {
+      const res = await app.request(path);
+      expect(res.status, path).toBe(200);
+      const body = (await res.json()) as { resource: string; authorization_servers: string[] };
+      expect(body.resource).toMatch(/\/mcp$/);
+      expect(body.authorization_servers).toHaveLength(1);
+    }
+  });
+
+  it("registers a ChatGPT-style redirect uri", async () => {
+    // ChatGPT self-registers via DCR with one of these callbacks.
+    for (const uri of [
+      "https://chatgpt.com/connector_platform_oauth_redirect",
+      "https://chatgpt.com/connector/oauth/abc123",
+    ]) {
+      const { res } = await register(app, [uri]);
+      expect(res.status, uri).toBe(201);
+    }
+  });
+
   it("rejects a mismatched PKCE verifier", async () => {
     stubGoogle();
     const { body: client } = await register(app);
@@ -249,6 +271,15 @@ describe("bearer auth on /mcp", () => {
         params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "0" } },
       }),
     });
+
+  it("lets a CORS preflight through without a token", async () => {
+    // Browsers never attach Authorization to a preflight; 401-ing it breaks the whole flow.
+    const res = await app.request("/mcp", {
+      method: "OPTIONS",
+      headers: { Origin: "https://chatgpt.com", "Access-Control-Request-Method": "POST" },
+    });
+    expect(res.status).toBe(204);
+  });
 
   it("401s without a token", async () => {
     const res = await post();

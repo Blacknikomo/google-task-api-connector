@@ -33,8 +33,10 @@ export function createApp(): Hono<{ Variables: Variables }> {
 
   app.route("/", oauthRoutes(deps));
 
-  app.use("/mcp", bearerAuth(deps));
-  app.post("/mcp", async (c) => {
+  // A CORS preflight carries no Authorization header by definition, so it must never go through
+  // bearer auth — hence the middleware is attached to POST rather than to the path.
+  app.options("/mcp", (c) => c.body(null, 204));
+  app.post("/mcp", bearerAuth(deps), async (c) => {
     const { cfg } = await deps();
     return handleMcpRequest(c.req.raw, cfg, c.get("auth"));
   });

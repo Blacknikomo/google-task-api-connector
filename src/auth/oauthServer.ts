@@ -9,7 +9,7 @@
  *   Claude → POST /oauth/token  (authorization_code + code_verifier | refresh_token)
  *   Claude → POST /mcp  Authorization: Bearer <access_token>
  */
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import type { Config } from "../config.js";
 import type { RefreshGrant, TokenStore } from "./store.js";
 import { encrypt, randomToken, sha256, signToken, verifyPkce } from "./crypto.js";
@@ -53,15 +53,21 @@ export function oauthRoutes(deps: () => Promise<OAuthDeps>): Hono {
     });
   });
 
-  // RFC 9728 – lets the client discover which authorization server protects /mcp
-  app.get("/.well-known/oauth-protected-resource", async (c) => {
+  // RFC 9728 – lets the client discover which authorization server protects /mcp.
+  // The spec derives the metadata URL by inserting the well-known segment *before* the resource
+  // path, so a client looking up https://host/mcp asks for /.well-known/oauth-protected-resource/mcp.
+  // Claude uses the bare path (we name it explicitly in WWW-Authenticate); other clients probe the
+  // suffixed one, so serve both.
+  const protectedResourceMetadata = async (c: Context) => {
     const { cfg } = await deps();
     return c.json({
       resource: `${cfg.baseUrl}/mcp`,
       authorization_servers: [cfg.baseUrl],
       bearer_methods_supported: ["header"],
     });
-  });
+  };
+  app.get("/.well-known/oauth-protected-resource", protectedResourceMetadata);
+  app.get("/.well-known/oauth-protected-resource/mcp", protectedResourceMetadata);
 
   app.post("/oauth/register", async (c) => {
     const { store } = await deps();

@@ -47,7 +47,7 @@ Resources:
     Type: AWS::Serverless::HttpApi
     Properties:
       CorsConfiguration:
-        AllowOrigins: ["https://claude.ai"]
+        AllowOrigins: ["https://claude.ai", "https://chatgpt.com", "https://chat.openai.com"]
         AllowMethods: [GET, POST, DELETE, OPTIONS]
         AllowHeaders: [Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version]
         ExposeHeaders: [Mcp-Session-Id]
