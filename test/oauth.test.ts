@@ -30,8 +30,14 @@ function stubGoogle(email = "owner@example.com", overrides: Record<string, unkno
       const params = new URLSearchParams(String(init?.body));
       const base =
         params.get("grant_type") === "authorization_code"
-          ? { access_token: "g-access-1", refresh_token: "g-refresh-1", expires_in: 3600, id_token: idTokenFor(email) }
-          : { access_token: "g-access-2", expires_in: 3600 };
+          ? {
+              access_token: "g-access-1",
+              refresh_token: "g-refresh-1",
+              expires_in: 3600,
+              id_token: idTokenFor(email),
+              scope: "https://www.googleapis.com/auth/tasks openid email",
+            }
+          : { access_token: "g-access-2", expires_in: 3600, scope: "https://www.googleapis.com/auth/tasks openid email" };
       return new Response(JSON.stringify({ ...base, ...overrides }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -165,6 +171,28 @@ describe("OAuth authorization server", () => {
     const { body: client } = await register(app);
     const { cbRes } = await authorizeToCode(app, client!.client_id);
     expect(cbRes.status).toBe(403);
+  });
+
+  it("refuses the connection when Google withholds the Tasks scope", async () => {
+    // The user can untick the Tasks permission on the consent screen, or the scope may not be
+    // declared under Data access — either way the token is useless for the Tasks API.
+    stubGoogle("owner@example.com", { scope: "openid email" });
+    const { body: client } = await register(app);
+    const { cbRes } = await authorizeToCode(app, client!.client_id);
+
+    expect(cbRes.status).toBe(403);
+    expect(await cbRes.text()).toMatch(/did not grant access to your Tasks/i);
+  });
+
+  it("requests the Tasks scope, offline access and forced consent", async () => {
+    stubGoogle();
+    const { body: client } = await register(app);
+    const { authRes } = await authorizeToCode(app, client!.client_id);
+    const q = new URL(authRes.headers.get("location")!).searchParams;
+
+    expect(q.get("scope")!.split(" ")).toContain("https://www.googleapis.com/auth/tasks");
+    expect(q.get("access_type")).toBe("offline");
+    expect(q.get("prompt")).toBe("consent");
   });
 
   it("fails the connection when Google returns no refresh token", async () => {

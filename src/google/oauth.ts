@@ -7,12 +7,17 @@ import type { Config } from "../config.js";
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 
+/** The one scope that actually lets us call the Tasks API (ADR 0011). */
+export const TASKS_SCOPE = "https://www.googleapis.com/auth/tasks";
+
 export interface GoogleTokens {
   accessToken: string;
   /** Present only when access_type=offline and prompt=consent (first grant) */
   refreshToken?: string;
   expiresAt: number; // epoch seconds
   idToken?: string;
+  /** Scopes Google actually granted — not necessarily the ones we asked for. */
+  grantedScopes: string[];
 }
 
 /** A Google token-endpoint failure. `invalid_grant` means the user must re-connect (ADR 0011). */
@@ -65,6 +70,7 @@ interface GoogleTokenResponse {
   refresh_token?: string;
   expires_in?: number;
   id_token?: string;
+  scope?: string;
   error?: string;
   error_description?: string;
 }
@@ -97,6 +103,7 @@ async function tokenRequest(cfg: Config, params: Record<string, string>): Promis
     // 60 s of slack so a token is never handed out moments before Google stops accepting it.
     expiresAt: Math.floor(Date.now() / 1000) + (json.expires_in ?? 3600) - 60,
     idToken: json.id_token,
+    grantedScopes: json.scope ? json.scope.split(" ").filter(Boolean) : [],
   };
 }
 

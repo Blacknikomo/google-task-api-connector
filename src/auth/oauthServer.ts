@@ -13,7 +13,7 @@ import { Hono } from "hono";
 import type { Config } from "../config.js";
 import type { RefreshGrant, TokenStore } from "./store.js";
 import { encrypt, randomToken, sha256, signToken, verifyPkce } from "./crypto.js";
-import { buildGoogleAuthUrl, emailFromIdToken, exchangeCode, GoogleOAuthError } from "../google/oauth.js";
+import { buildGoogleAuthUrl, emailFromIdToken, exchangeCode, GoogleOAuthError, TASKS_SCOPE } from "../google/oauth.js";
 
 export const ACCESS_TOKEN_TTL = 60 * 60; // 1h
 export const CODE_TTL = 10 * 60;
@@ -166,6 +166,23 @@ export function oauthRoutes(deps: () => Promise<OAuthDeps>): Hono {
       return c.text("Google did not return a refresh token. Remove the app at myaccount.google.com and connect again.", 400);
     }
     if (!tokens.idToken) return c.text("Google did not return an ID token; cannot identify the account.", 400);
+
+    // Google can grant fewer scopes than we ask for — the user can untick a permission on the
+    // consent screen, and a scope not declared under "Data access" in the Cloud console may be
+    // dropped. Catching it here turns an opaque 403 ACCESS_TOKEN_SCOPE_INSUFFICIENT on the first
+    // tool call into a clear failure at connect time.
+    if (!tokens.grantedScopes.includes(TASKS_SCOPE)) {
+      console.error(`Google granted scopes without ${TASKS_SCOPE}: [${tokens.grantedScopes.join(", ")}]`);
+      return c.text(
+        "Google did not grant access to your Tasks.\n\n" +
+          `Granted: ${tokens.grantedScopes.join(", ") || "(none reported)"}\n` +
+          `Required: ${TASKS_SCOPE}\n\n` +
+          "On the Google consent screen, tick \"View, edit, create and delete your tasks\". " +
+          "If that permission was not offered at all, add the Tasks scope under " +
+          "Google Cloud console > APIs & Services > Data access, then connect again.",
+        403,
+      );
+    }
 
     const email = emailFromIdToken(tokens.idToken);
     if (cfg.allowedEmails.length > 0 && !cfg.allowedEmails.includes(email)) {
