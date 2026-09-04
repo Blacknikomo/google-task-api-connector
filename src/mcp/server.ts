@@ -19,12 +19,18 @@ export async function handleMcpRequest(req: Request, cfg: Config, auth: AuthCont
 
   const transport = new WebStandardStreamableHTTPServerTransport({
     sessionIdGenerator: undefined, // stateless
+    // API Gateway buffers the whole Lambda response, so an SSE stream can never actually stream
+    // through it. Ask the transport for a single JSON response instead.
+    enableJsonResponse: true,
   });
   await server.connect(transport);
-  try {
-    return await transport.handleRequest(req);
-  } finally {
-    // TODO: confirm whether close() is needed per request in stateless mode with the installed SDK version
-    await transport.close().catch(() => undefined);
-  }
+
+  // Do NOT close before the body is read: closing an in-flight response leaves the client with an
+  // empty body. Read it here, then tear down and hand back an equivalent Response.
+  const res = await transport.handleRequest(req);
+  const body = await res.text();
+  await transport.close().catch(() => undefined);
+  await server.close().catch(() => undefined);
+
+  return new Response(body || null, { status: res.status, headers: res.headers });
 }

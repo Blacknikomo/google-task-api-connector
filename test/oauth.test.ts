@@ -76,6 +76,15 @@ async function exchange(app: App, clientId: string, code: string, verifier = VER
   return { res, body: (await res.json()) as Record<string, string> };
 }
 
+/** Run register -> authorize -> callback -> token and return the issued access token. */
+async function connect(app: App): Promise<string> {
+  const { body: client } = await register(app);
+  const { cbRes } = await authorizeToCode(app, client!.client_id);
+  const code = new URL(cbRes.headers.get("location")!).searchParams.get("code")!;
+  const { body } = await exchange(app, client!.client_id, code);
+  return body.access_token;
+}
+
 describe("OAuth authorization server", () => {
   let app: App;
   beforeEach(() => {
@@ -221,24 +230,47 @@ describe("bearer auth on /mcp", () => {
 
   it("401s on a tampered token", async () => {
     stubGoogle();
-    const { body: client } = await register(app);
-    const { cbRes } = await authorizeToCode(app, client!.client_id);
-    const code = new URL(cbRes.headers.get("location")!).searchParams.get("code")!;
-    const { body } = await exchange(app, client!.client_id, code);
+    const token = await connect(app);
 
-    const [payload] = body.access_token.split(".");
+    const [payload] = token.split(".");
     expect((await post(`${payload}.forgedsignature`)).status).toBe(401);
   });
 
-  it("accepts a freshly issued token and reaches the MCP transport", async () => {
+  it("answers initialize with a non-empty JSON-RPC result", async () => {
     stubGoogle();
-    const { body: client } = await register(app);
-    const { cbRes } = await authorizeToCode(app, client!.client_id);
-    const code = new URL(cbRes.headers.get("location")!).searchParams.get("code")!;
-    const { body } = await exchange(app, client!.client_id, code);
+    const token = await connect(app);
 
-    const res = await post(body.access_token);
-    expect(res.status).not.toBe(401);
-    expect(res.status).toBeLessThan(500);
+    const res = await post(token);
+    expect(res.status).toBe(200);
+    // Regression: with SSE mode plus an eager transport.close() this was a 200 with an EMPTY body,
+    // which the client reports as a connection error rather than a failure.
+    expect(res.headers.get("content-type")).toContain("application/json");
+    const text = await res.text();
+    expect(text).not.toBe("");
+    expect(JSON.parse(text)).toMatchObject({
+      jsonrpc: "2.0",
+      id: 1,
+      result: { serverInfo: { name: "google-tasks-connector" } },
+    });
+  });
+
+  it("lists every tool over the transport", async () => {
+    stubGoogle();
+    const token = await connect(app);
+
+    const res = await app.request("/mcp", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+    });
+
+    const body = (await res.json()) as { result?: { tools?: { name: string }[] } };
+    expect(body.result?.tools?.map((t) => t.name).sort()).toEqual(
+      ["complete_task", "create_task", "find_tasks", "list_task_lists", "list_tasks"].sort(),
+    );
   });
 });
