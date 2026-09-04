@@ -32,11 +32,21 @@ export interface RefreshGrant {
   clientId: string;
   email: string;
   googleRefreshTokenEnc: string;
+  /**
+   * Stable id for the underlying Google grant. Survives refresh-token rotation, which replaces the
+   * `refresh#<hash>` row on every use — keying the Google access-token cache by this instead of by
+   * the rotating hash keeps the cache warm across rotations.
+   */
+  grantId: string;
 }
 
 export interface CachedGoogleAccess {
   accessToken: string;
-  expiresAt: number;
+  /**
+   * Epoch seconds. Deliberately NOT named `expiresAt`: that attribute is reserved for the DynamoDB
+   * TTL and is stripped on read, which would silently make this field undefined.
+   */
+  accessExpiresAt: number;
 }
 
 export interface TokenStore {
@@ -55,8 +65,8 @@ export interface TokenStore {
   getRefreshGrant(tokenHash: string): Promise<RefreshGrant | undefined>;
   deleteRefreshGrant(tokenHash: string): Promise<void>;
 
-  putGoogleAccess(tokenHash: string, a: CachedGoogleAccess): Promise<void>;
-  getGoogleAccess(tokenHash: string): Promise<CachedGoogleAccess | undefined>;
+  putGoogleAccess(grantId: string, a: CachedGoogleAccess): Promise<void>;
+  getGoogleAccess(grantId: string): Promise<CachedGoogleAccess | undefined>;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,11 +105,11 @@ export class DynamoTokenStore implements TokenStore {
   deleteRefreshGrant(h: string) {
     return this.del(`refresh#${h}`);
   }
-  putGoogleAccess(h: string, a: CachedGoogleAccess) {
-    return this.put(`gaccess#${h}`, a, Math.max(0, a.expiresAt - now()));
+  putGoogleAccess(grantId: string, a: CachedGoogleAccess) {
+    return this.put(`gaccess#${grantId}`, a, Math.max(1, a.accessExpiresAt - now()));
   }
-  getGoogleAccess(h: string) {
-    return this.get<CachedGoogleAccess>(`gaccess#${h}`);
+  getGoogleAccess(grantId: string) {
+    return this.get<CachedGoogleAccess>(`gaccess#${grantId}`);
   }
 
   private async put(pk: string, item: object, ttlSeconds?: number) {
@@ -112,20 +122,27 @@ export class DynamoTokenStore implements TokenStore {
   }
   private async get<T>(pk: string): Promise<T | undefined> {
     const out = await this.db.send(new GetCommand({ TableName: this.table, Key: { pk } }));
-    if (!out.Item) return undefined;
-    // TTL deletion is lazy (up to 48h); enforce expiry on read.
-    if (typeof out.Item.expiresAt === "number" && out.Item.expiresAt < now()) return undefined;
-    const { pk: _pk, expiresAt: _exp, ...rest } = out.Item;
-    return rest as T;
+    return this.unwrap<T>(out.Item);
   }
   private async del(pk: string) {
     await this.db.send(new DeleteCommand({ TableName: this.table, Key: { pk } }));
   }
+  /**
+   * Atomic single-use read: the delete is the read. Two concurrent callers cannot both receive the
+   * item, which is what makes an authorization code single-use and prevents code replay.
+   */
   private async take<T>(pk: string): Promise<T | undefined> {
-    // TODO: use DeleteCommand with ReturnValues: "ALL_OLD" for an atomic take
-    const v = await this.get<T>(pk);
-    if (v) await this.del(pk);
-    return v;
+    const out = await this.db.send(
+      new DeleteCommand({ TableName: this.table, Key: { pk }, ReturnValues: "ALL_OLD" }),
+    );
+    return this.unwrap<T>(out.Attributes);
+  }
+  private unwrap<T>(item: Record<string, unknown> | undefined): T | undefined {
+    if (!item) return undefined;
+    // TTL deletion is lazy (up to 48h); enforce expiry on read.
+    if (typeof item.expiresAt === "number" && item.expiresAt < now()) return undefined;
+    const { pk: _pk, expiresAt: _exp, ...rest } = item;
+    return rest as T;
   }
 }
 
@@ -144,8 +161,9 @@ export class MemoryTokenStore implements TokenStore {
   putRefreshGrant = async (h: string, g: RefreshGrant) => this.set(`refresh#${h}`, g);
   getRefreshGrant = async (h: string) => this.get<RefreshGrant>(`refresh#${h}`);
   deleteRefreshGrant = async (h: string) => void this.m.delete(`refresh#${h}`);
-  putGoogleAccess = async (h: string, a: CachedGoogleAccess) => this.set(`gaccess#${h}`, a, a.expiresAt - now());
-  getGoogleAccess = async (h: string) => this.get<CachedGoogleAccess>(`gaccess#${h}`);
+  putGoogleAccess = async (grantId: string, a: CachedGoogleAccess) =>
+    this.set(`gaccess#${grantId}`, a, Math.max(1, a.accessExpiresAt - now()));
+  getGoogleAccess = async (grantId: string) => this.get<CachedGoogleAccess>(`gaccess#${grantId}`);
 
   private set(k: string, v: unknown, ttl?: number) {
     this.m.set(k, { v, exp: ttl ? now() + ttl : undefined });

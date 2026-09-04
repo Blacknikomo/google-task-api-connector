@@ -2,7 +2,7 @@
 
 A remote [MCP](https://modelcontextprotocol.io) server that gives Claude access to Google Tasks. Registered as a custom connector in claude.ai, it works on every device tied to the account.
 
-Status: skeleton — structure and typed stubs; API calls and OAuth token endpoints are marked `TODO`.
+Status: functional — the OAuth flow, token handling and Tasks API calls are implemented and deployed. Not yet exercised against a real Google consent screen end-to-end.
 
 ## Tools
 

@@ -3,7 +3,7 @@
  */
 import { Hono } from "hono";
 import { loadConfig } from "./config.js";
-import { createStore } from "./auth/store.js";
+import { createStore, type TokenStore } from "./auth/store.js";
 import { oauthRoutes } from "./auth/oauthServer.js";
 import { bearerAuth, type Variables } from "./auth/bearer.js";
 import { handleMcpRequest } from "./mcp/server.js";
@@ -13,9 +13,13 @@ export function createApp(): Hono<{ Variables: Variables }> {
 
   // Config depends on the request host when no BASE_URL is set (API Gateway default domain).
   let baseUrlFromRequest: string | undefined;
+  // Reused across invocations in a warm container: the store owns a DynamoDB client whose
+  // connection pool is worth keeping.
+  let store: TokenStore | undefined;
   const deps = async () => {
     const cfg = await loadConfig(baseUrlFromRequest);
-    return { cfg, store: createStore(cfg.tokenTableName) };
+    store ??= createStore(cfg.tokenTableName);
+    return { cfg, store };
   };
 
   app.use("*", async (c, next) => {

@@ -11,17 +11,28 @@
  */
 import { Hono } from "hono";
 import type { Config } from "../config.js";
-import type { TokenStore } from "./store.js";
-import { randomToken, sha256 } from "./crypto.js";
-import { buildGoogleAuthUrl } from "../google/oauth.js";
+import type { RefreshGrant, TokenStore } from "./store.js";
+import { encrypt, randomToken, sha256, signToken, verifyPkce } from "./crypto.js";
+import { buildGoogleAuthUrl, emailFromIdToken, exchangeCode, GoogleOAuthError } from "../google/oauth.js";
 
 export const ACCESS_TOKEN_TTL = 60 * 60; // 1h
 export const CODE_TTL = 10 * 60;
 export const STATE_TTL = 10 * 60;
+export const ISSUED_SCOPE = "tasks";
 
 export interface OAuthDeps {
   cfg: Config;
   store: TokenStore;
+}
+
+/** Claims inside the signed access token we issue to Claude. Nothing is stored server-side. */
+export interface AccessClaims {
+  /** Google account email */
+  sub: string;
+  /** sha256 of the refresh token whose grant row holds the Google refresh token */
+  rgh: string;
+  /** epoch seconds */
+  exp: number;
 }
 
 export function oauthRoutes(deps: () => Promise<OAuthDeps>): Hono {
@@ -38,7 +49,7 @@ export function oauthRoutes(deps: () => Promise<OAuthDeps>): Hono {
       grant_types_supported: ["authorization_code", "refresh_token"],
       code_challenge_methods_supported: ["S256"],
       token_endpoint_auth_methods_supported: ["none"],
-      scopes_supported: ["tasks"],
+      scopes_supported: [ISSUED_SCOPE],
     });
   });
 
@@ -54,20 +65,32 @@ export function oauthRoutes(deps: () => Promise<OAuthDeps>): Hono {
 
   app.post("/oauth/register", async (c) => {
     const { store } = await deps();
-    const body = await c.req.json<{ redirect_uris?: string[]; client_name?: string }>();
-    // TODO: validate redirect_uris are https (or http://localhost), reject empty
+
+    let body: { redirect_uris?: unknown; client_name?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "invalid_client_metadata", error_description: "body must be JSON" }, 400);
+    }
+
+    const uris = body.redirect_uris;
+    if (!Array.isArray(uris) || uris.length === 0 || !uris.every((u) => typeof u === "string")) {
+      return c.json({ error: "invalid_redirect_uri", error_description: "redirect_uris must be a non-empty array of strings" }, 400);
+    }
+    const invalid = uris.find((u) => !isAllowedRedirectUri(u));
+    if (invalid) {
+      return c.json({ error: "invalid_redirect_uri", error_description: `redirect_uri must be https or http://localhost: ${invalid}` }, 400);
+    }
+
     const clientId = randomToken(16);
-    await store.putClient({
-      clientId,
-      clientName: body.client_name,
-      redirectUris: body.redirect_uris ?? [],
-      createdAt: Date.now(),
-    });
+    const clientName = typeof body.client_name === "string" ? body.client_name : undefined;
+    await store.putClient({ clientId, clientName, redirectUris: uris, createdAt: Date.now() });
+
     return c.json(
       {
         client_id: clientId,
-        client_name: body.client_name,
-        redirect_uris: body.redirect_uris,
+        client_name: clientName,
+        redirect_uris: uris,
         token_endpoint_auth_method: "none",
         grant_types: ["authorization_code", "refresh_token"],
         response_types: ["code"],
@@ -79,8 +102,23 @@ export function oauthRoutes(deps: () => Promise<OAuthDeps>): Hono {
   app.get("/oauth/authorize", async (c) => {
     const { cfg, store } = await deps();
     const q = c.req.query();
-    // TODO: validate client_id exists, redirect_uri ∈ client.redirectUris,
-    //       response_type === "code", code_challenge_method === "S256"; on error redirect with error=invalid_request
+
+    // Errors that cannot be attributed to a registered redirect_uri must NOT redirect (RFC 6749 §4.1.2.1),
+    // otherwise the endpoint becomes an open redirector.
+    if (!q.client_id) return c.text("Missing client_id", 400);
+    const client = await store.getClient(q.client_id);
+    if (!client) return c.text("Unknown client_id", 400);
+    if (!q.redirect_uri) return c.text("Missing redirect_uri", 400);
+    if (!client.redirectUris.includes(q.redirect_uri)) return c.text("redirect_uri does not match the registered URIs", 400);
+
+    // From here the redirect_uri is trusted, so errors go back to the client.
+    const reject = (error: string, description: string) =>
+      c.redirect(redirectWithParams(q.redirect_uri, { error, error_description: description, state: q.state }), 302);
+
+    if (q.response_type !== "code") return reject("unsupported_response_type", "response_type must be 'code'");
+    if (!q.code_challenge) return reject("invalid_request", "code_challenge is required (PKCE)");
+    if (q.code_challenge_method !== "S256") return reject("invalid_request", "code_challenge_method must be S256");
+
     const state = randomToken(24);
     await store.putPending(
       state,
@@ -98,43 +136,156 @@ export function oauthRoutes(deps: () => Promise<OAuthDeps>): Hono {
   });
 
   app.get("/oauth/google/callback", async (c) => {
-    const { store } = await deps();
+    const { cfg, store } = await deps();
     const { code, state, error } = c.req.query();
+
     if (error) return c.text(`Google returned error: ${error}`, 400);
+    if (!state || !code) return c.text("Missing code or state", 400);
+
     const pending = await store.takePending(state);
     if (!pending) return c.text("Unknown or expired state", 400);
-    // TODO:
-    //  1. exchangeCode(cfg, code) → tokens (must include refreshToken)
-    //  2. email = emailFromIdToken(tokens.idToken); enforce cfg.allowedEmails (ADR 0011)
-    //  3. ourCode = randomToken(); store.putAuthCode(ourCode, { ...pending, email, googleRefreshTokenEnc: encrypt(...) }, CODE_TTL)
-    //  4. redirect to `${pending.redirectUri}?code=${ourCode}&state=${pending.clientState}`
-    void code;
-    return c.text("Google callback not implemented", 501);
+
+    let tokens;
+    try {
+      tokens = await exchangeCode(cfg, code);
+    } catch (e) {
+      const msg = e instanceof GoogleOAuthError ? e.message : String(e);
+      console.error("Google code exchange failed:", msg);
+      return c.redirect(
+        redirectWithParams(pending.redirectUri, {
+          error: "access_denied",
+          error_description: "Google code exchange failed",
+          state: pending.clientState,
+        }),
+        302,
+      );
+    }
+
+    if (!tokens.refreshToken) {
+      // access_type=offline + prompt=consent should always yield one; without it we could never refresh.
+      return c.text("Google did not return a refresh token. Remove the app at myaccount.google.com and connect again.", 400);
+    }
+    if (!tokens.idToken) return c.text("Google did not return an ID token; cannot identify the account.", 400);
+
+    const email = emailFromIdToken(tokens.idToken);
+    if (cfg.allowedEmails.length > 0 && !cfg.allowedEmails.includes(email)) {
+      // ADR 0011: defence in depth behind the Google app's Testing-mode test-user list.
+      console.warn(`Rejected connection attempt from non-allow-listed account: ${email}`);
+      return c.text("This Google account is not allowed to use this connector.", 403);
+    }
+
+    const ourCode = randomToken();
+    await store.putAuthCode(
+      ourCode,
+      { ...pending, email, googleRefreshTokenEnc: encrypt(tokens.refreshToken, cfg.tokenSigningKey) },
+      CODE_TTL,
+    );
+
+    return c.redirect(redirectWithParams(pending.redirectUri, { code: ourCode, state: pending.clientState }), 302);
   });
 
   app.post("/oauth/token", async (c) => {
-    const { store } = await deps();
+    const { cfg, store } = await deps();
+    // RFC 6749 §5.1: token responses must not be cached.
+    c.header("Cache-Control", "no-store");
+    c.header("Pragma", "no-cache");
+
     const form = await c.req.parseBody();
-    const grant = String(form.grant_type ?? "");
+    const field = (name: string): string | undefined => {
+      const v = form[name];
+      return typeof v === "string" && v.length > 0 ? v : undefined;
+    };
+    const grant = field("grant_type") ?? "";
+
     if (grant === "authorization_code") {
-      // TODO:
-      //  - takeAuthCode(code); verify client_id, redirect_uri, verifyPkce(code_verifier, codeChallenge)
-      //  - issue access token (signed/opaque, ACCESS_TOKEN_TTL) + refresh token (store by sha256 hash)
-      //  - respond { access_token, token_type: "Bearer", expires_in, refresh_token, scope }
-      void store;
-      return c.json({ error: "unsupported_grant_type", error_description: "not implemented" }, 400);
+      const code = field("code");
+      const clientId = field("client_id");
+      const verifier = field("code_verifier");
+      if (!code || !clientId || !verifier) {
+        return c.json({ error: "invalid_request", error_description: "code, client_id and code_verifier are required" }, 400);
+      }
+
+      const authCode = await store.takeAuthCode(code);
+      if (!authCode) return c.json({ error: "invalid_grant", error_description: "unknown or expired code" }, 400);
+      if (authCode.clientId !== clientId) return c.json({ error: "invalid_grant", error_description: "client_id mismatch" }, 400);
+
+      const redirectUri = field("redirect_uri");
+      if (redirectUri && redirectUri !== authCode.redirectUri) {
+        return c.json({ error: "invalid_grant", error_description: "redirect_uri mismatch" }, 400);
+      }
+      if (!verifyPkce(verifier, authCode.codeChallenge)) {
+        return c.json({ error: "invalid_grant", error_description: "PKCE verification failed" }, 400);
+      }
+
+      return c.json(
+        await issueTokens(cfg, store, {
+          clientId: authCode.clientId,
+          email: authCode.email,
+          googleRefreshTokenEnc: authCode.googleRefreshTokenEnc,
+          grantId: randomToken(16),
+        }),
+      );
     }
+
     if (grant === "refresh_token") {
-      // TODO: rotate: getRefreshGrant(sha256(old)) → delete → issue new pair
-      return c.json({ error: "unsupported_grant_type", error_description: "not implemented" }, 400);
+      const presented = field("refresh_token");
+      if (!presented) return c.json({ error: "invalid_request", error_description: "refresh_token is required" }, 400);
+
+      const oldHash = sha256(presented);
+      const existing = await store.getRefreshGrant(oldHash);
+      if (!existing) return c.json({ error: "invalid_grant", error_description: "unknown or already-used refresh token" }, 400);
+
+      const clientId = field("client_id");
+      if (clientId && clientId !== existing.clientId) {
+        return c.json({ error: "invalid_grant", error_description: "client_id mismatch" }, 400);
+      }
+
+      // Rotate: the presented token is single-use (ADR 0006).
+      await store.deleteRefreshGrant(oldHash);
+      return c.json(await issueTokens(cfg, store, existing));
     }
-    return c.json({ error: "unsupported_grant_type" }, 400);
+
+    return c.json({ error: "unsupported_grant_type", error_description: `unsupported grant_type: ${grant}` }, 400);
   });
 
   return app;
 }
 
-/** Stable, non-reversible id used as cache key for Google access tokens. */
-export function accessTokenHash(bearer: string): string {
-  return sha256(bearer);
+/** Mint a fresh access/refresh pair for a grant, persisting the new refresh token by hash. */
+async function issueTokens(cfg: Config, store: TokenStore, grant: RefreshGrant) {
+  const refreshToken = randomToken();
+  const rgh = sha256(refreshToken);
+  await store.putRefreshGrant(rgh, grant);
+
+  const claims: AccessClaims = {
+    sub: grant.email,
+    rgh,
+    exp: Math.floor(Date.now() / 1000) + ACCESS_TOKEN_TTL,
+  };
+
+  return {
+    access_token: signToken(claims, cfg.tokenSigningKey),
+    token_type: "Bearer",
+    expires_in: ACCESS_TOKEN_TTL,
+    refresh_token: refreshToken,
+    scope: ISSUED_SCOPE,
+  };
+}
+
+/** https, or http on loopback for local clients (OAuth 2.1 §4.1.3 / RFC 8252). */
+function isAllowedRedirectUri(uri: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(uri);
+  } catch {
+    return false;
+  }
+  if (u.protocol === "https:") return true;
+  return u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]");
+}
+
+function redirectWithParams(uri: string, params: Record<string, string | undefined>): string {
+  const u = new URL(uri);
+  for (const [k, v] of Object.entries(params)) if (v !== undefined) u.searchParams.set(k, v);
+  return u.toString();
 }

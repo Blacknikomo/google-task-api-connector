@@ -5,39 +5,93 @@
 import type { NewTask, Task, TaskList } from "../types.js";
 
 const BASE = "https://tasks.googleapis.com/tasks/v1";
+const PAGE_SIZE = 100; // Google's maximum
+
+/** Shape of a task as returned by the API (only the fields we use). */
+interface ApiTask {
+  id: string;
+  title?: string;
+  notes?: string;
+  status?: string;
+  due?: string;
+  completed?: string;
+  updated?: string;
+  parent?: string;
+  webViewLink?: string;
+}
+
+interface ApiTaskList {
+  id: string;
+  title?: string;
+  updated?: string;
+}
+
+interface Page<T> {
+  items?: T[];
+  nextPageToken?: string;
+}
 
 export class GoogleTasksClient {
   constructor(private readonly accessToken: string) {}
 
   async listTaskLists(): Promise<TaskList[]> {
-    // TODO: GET /users/@me/lists (paginate with pageToken)
-    throw new NotImplemented("listTaskLists");
+    const items = await this.paginate<ApiTaskList>("/users/@me/lists", {});
+    return items.map((l) => ({ id: l.id, title: l.title ?? "(untitled)", updated: l.updated ?? "" }));
   }
 
   /** Open (needsAction) tasks in a list. Google returns max 100 per page; paginate. */
   async listOpenTasks(listId: string, opts: { dueMin?: string; dueMax?: string } = {}): Promise<Task[]> {
-    // TODO: GET /lists/{listId}/tasks?showCompleted=false&showHidden=false&dueMin&dueMax
-    void opts;
-    throw new NotImplemented("listOpenTasks");
+    const query: Record<string, string> = {
+      showCompleted: "false",
+      showHidden: "false",
+    };
+    // Google expects RFC 3339 timestamps; widen a date to cover the whole day.
+    if (opts.dueMin) query.dueMin = `${opts.dueMin}T00:00:00.000Z`;
+    if (opts.dueMax) query.dueMax = `${opts.dueMax}T23:59:59.999Z`;
+
+    const items = await this.paginate<ApiTask>(`/lists/${encodeURIComponent(listId)}/tasks`, query);
+    return items.filter((t) => t.status !== "completed").map((t) => toTask(t, listId));
   }
 
   async createTask(task: NewTask & { listId: string }): Promise<Task> {
-    // TODO: POST /lists/{listId}/tasks  body: { title, notes, due: `${due}T00:00:00.000Z` }
-    throw new NotImplemented("createTask");
+    const body: Record<string, unknown> = { title: task.title };
+    if (task.notes) body.notes = task.notes;
+    // Google Tasks stores a date only; any time component is ignored and echoed back as 00:00:00Z.
+    if (task.due) body.due = `${task.due}T00:00:00.000Z`;
+
+    const created = await this.request<ApiTask>("POST", `/lists/${encodeURIComponent(task.listId)}/tasks`, body);
+    return toTask(created, task.listId);
   }
 
   async completeTask(listId: string, taskId: string): Promise<Task> {
-    // TODO: PATCH /lists/{listId}/tasks/{taskId}  body: { status: "completed" }
-    throw new NotImplemented("completeTask");
+    const updated = await this.request<ApiTask>(
+      "PATCH",
+      `/lists/${encodeURIComponent(listId)}/tasks/${encodeURIComponent(taskId)}`,
+      { status: "completed" },
+    );
+    return toTask(updated, listId);
   }
 
   /** The list Google calls "@default" — resolves to its real id. */
   async defaultListId(): Promise<string> {
-    // TODO: GET /lists/@default → id
-    throw new NotImplemented("defaultListId");
+    const list = await this.request<ApiTaskList>("GET", "/users/@me/lists/@default");
+    return list.id;
   }
 
   // ---- internals -------------------------------------------------------
+
+  private async paginate<T>(path: string, query: Record<string, string>): Promise<T[]> {
+    const all: T[] = [];
+    let pageToken: string | undefined;
+    do {
+      const params = new URLSearchParams({ ...query, maxResults: String(PAGE_SIZE) });
+      if (pageToken) params.set("pageToken", pageToken);
+      const page = await this.request<Page<T>>("GET", `${path}?${params}`);
+      all.push(...(page.items ?? []));
+      pageToken = page.nextPageToken;
+    } while (pageToken);
+    return all;
+  }
 
   protected async request<T>(method: string, path: string, body?: unknown): Promise<T> {
     const res = await fetch(`${BASE}${path}`, {
@@ -49,24 +103,52 @@ export class GoogleTasksClient {
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     if (!res.ok) {
-      // TODO: map 401 → re-auth hint, 403 quota, 404 list/task not found, 429 retry-after
-      throw new GoogleApiError(res.status, await res.text());
+      throw new GoogleApiError(res.status, await res.text(), res.headers.get("retry-after") ?? undefined);
     }
-    return (await res.json()) as T;
+    // 204 on some mutations, and PATCH may return an empty body.
+    if (res.status === 204) return undefined as T;
+    const text = await res.text();
+    return (text ? JSON.parse(text) : undefined) as T;
   }
+}
+
+function toTask(t: ApiTask, listId: string): Task {
+  return {
+    id: t.id,
+    listId,
+    title: t.title ?? "",
+    notes: t.notes,
+    status: t.status === "completed" ? "completed" : "needsAction",
+    due: t.due,
+    completed: t.completed,
+    updated: t.updated ?? "",
+    parent: t.parent,
+    webViewLink: t.webViewLink,
+  };
 }
 
 export class GoogleApiError extends Error {
   constructor(
     public readonly status: number,
     body: string,
+    public readonly retryAfter?: string,
   ) {
-    super(`Google Tasks API ${status}: ${body}`);
+    super(`Google Tasks API ${status}: ${hint(status)}${body ? ` — ${body}` : ""}`);
   }
 }
 
-export class NotImplemented extends Error {
-  constructor(what: string) {
-    super(`${what} is not implemented yet`);
+/** Turn a bare status into something the model can act on. */
+function hint(status: number): string {
+  switch (status) {
+    case 401:
+      return "access token rejected; the connector must re-authorize";
+    case 403:
+      return "forbidden — missing scope or quota exceeded";
+    case 404:
+      return "list or task not found";
+    case 429:
+      return "rate limited; retry later";
+    default:
+      return "request failed";
   }
 }

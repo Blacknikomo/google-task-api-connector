@@ -15,6 +15,21 @@ export interface GoogleTokens {
   idToken?: string;
 }
 
+/** A Google token-endpoint failure. `invalid_grant` means the user must re-connect (ADR 0011). */
+export class GoogleOAuthError extends Error {
+  constructor(
+    public readonly code: string,
+    public readonly status: number,
+    description?: string,
+  ) {
+    super(`Google OAuth ${status} ${code}${description ? `: ${description}` : ""}`);
+  }
+  /** Refresh token revoked, expired (Testing-mode apps expire them after 7 days) or already used. */
+  get requiresReconnect(): boolean {
+    return this.code === "invalid_grant";
+  }
+}
+
 export function googleRedirectUri(cfg: Config): string {
   return `${cfg.baseUrl}/oauth/google/callback`;
 }
@@ -34,15 +49,55 @@ export function buildGoogleAuthUrl(cfg: Config, state: string): string {
 }
 
 export async function exchangeCode(cfg: Config, code: string): Promise<GoogleTokens> {
-  // TODO: POST TOKEN_URL grant_type=authorization_code
-  void code;
-  throw new Error("exchangeCode not implemented");
+  return tokenRequest(cfg, {
+    grant_type: "authorization_code",
+    code,
+    redirect_uri: googleRedirectUri(cfg),
+  });
 }
 
 export async function refreshAccessToken(cfg: Config, refreshToken: string): Promise<GoogleTokens> {
-  // TODO: POST TOKEN_URL grant_type=refresh_token; handle invalid_grant → require re-connect
-  void refreshToken;
-  throw new Error("refreshAccessToken not implemented");
+  return tokenRequest(cfg, { grant_type: "refresh_token", refresh_token: refreshToken });
+}
+
+interface GoogleTokenResponse {
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: number;
+  id_token?: string;
+  error?: string;
+  error_description?: string;
+}
+
+async function tokenRequest(cfg: Config, params: Record<string, string>): Promise<GoogleTokens> {
+  const res = await fetch(TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      ...params,
+      client_id: cfg.google.clientId,
+      client_secret: cfg.google.clientSecret,
+    }),
+  });
+
+  let json: GoogleTokenResponse;
+  try {
+    json = (await res.json()) as GoogleTokenResponse;
+  } catch {
+    throw new GoogleOAuthError("invalid_response", res.status, "token endpoint returned non-JSON");
+  }
+
+  if (!res.ok || !json.access_token) {
+    throw new GoogleOAuthError(json.error ?? "unknown_error", res.status, json.error_description);
+  }
+
+  return {
+    accessToken: json.access_token,
+    refreshToken: json.refresh_token,
+    // 60 s of slack so a token is never handed out moments before Google stops accepting it.
+    expiresAt: Math.floor(Date.now() / 1000) + (json.expires_in ?? 3600) - 60,
+    idToken: json.id_token,
+  };
 }
 
 /** Extract email from the ID token. Signature verification is optional here: the token came directly from Google over TLS. */
