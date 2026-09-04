@@ -1,0 +1,35 @@
+{
+  "name": "google-task-api-connector",
+  "version": "0.1.0",
+  "description": "Remote MCP server exposing Google Tasks to Claude (claude.ai custom connector), hosted on AWS Lambda.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "lint": "eslint src",
+    "dev": "node --env-file=.env --import tsx src/local.ts",
+    "deploy": "sam build && sam deploy --guided"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.650.0",
+    "@aws-sdk/client-secrets-manager": "^3.650.0",
+    "@aws-sdk/lib-dynamodb": "^3.650.0",
+    "@hono/node-server": "^1.13.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "hono": "^4.6.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^20.16.0",
+    "eslint": "^9.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

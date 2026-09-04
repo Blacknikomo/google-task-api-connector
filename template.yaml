@@ -1,0 +1,103 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Google Tasks MCP connector for Claude.
+  API Gateway (HTTP API) -> Lambda (Node 20, Hono + MCP SDK) -> DynamoDB (tokens) + Secrets Manager (Google OAuth client).
+
+Parameters:
+  GoogleOAuthSecretName:
+    Type: String
+    Default: google-tasks-connector/google-oauth
+    Description: Secrets Manager secret holding {"client_id":"...","client_secret":"..."}
+  TokenSigningSecretName:
+    Type: String
+    Default: google-tasks-connector/token-signing
+    Description: Secrets Manager secret holding {"key":"<base64 32 bytes>"}
+  AllowedEmails:
+    Type: String
+    Default: ""
+    Description: Comma-separated Google account emails allowed to connect (empty = any account the Google OAuth app accepts)
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Architectures: [arm64]
+    Timeout: 29 # API Gateway HTTP API hard limit is 30s
+    MemorySize: 512
+    Tracing: Active
+
+Resources:
+  TokenTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: ["https://claude.ai"]
+        AllowMethods: [GET, POST, DELETE, OPTIONS]
+        AllowHeaders: [Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version]
+        ExposeHeaders: [Mcp-Session-Id]
+
+  ConnectorFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Format: esm
+        OutExtension: [".js=.mjs"]
+        Sourcemap: true
+        EntryPoints: [src/handler.ts]
+    Properties:
+      Handler: handler.handler
+      CodeUri: .
+      Environment:
+        Variables:
+          TOKEN_TABLE_NAME: !Ref TokenTable
+          GOOGLE_OAUTH_SECRET_NAME: !Ref GoogleOAuthSecretName
+          TOKEN_SIGNING_SECRET_NAME: !Ref TokenSigningSecretName
+          ALLOWED_EMAILS: !Ref AllowedEmails
+          # BASE_URL is derived at runtime from the request Host header; override here if using a custom domain.
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TokenTable
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GoogleOAuthSecretName}-*"
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${TokenSigningSecretName}-*"
+      Events:
+        AnyRoute:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /{proxy+}
+            Method: ANY
+        Root:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /
+            Method: ANY
+
+Outputs:
+  McpEndpoint:
+    Description: URL to paste into Claude > Settings > Connectors > Add custom connector
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/mcp"
+  GoogleRedirectUri:
+    Description: Register this as an authorized redirect URI in the Google Cloud OAuth client
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/oauth/google/callback"
