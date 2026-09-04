@@ -115,7 +115,9 @@ export function oauthRoutes(deps: () => Promise<OAuthDeps>): Hono {
     const client = await store.getClient(q.client_id);
     if (!client) return c.text("Unknown client_id", 400);
     if (!q.redirect_uri) return c.text("Missing redirect_uri", 400);
-    if (!client.redirectUris.includes(q.redirect_uri)) return c.text("redirect_uri does not match the registered URIs", 400);
+    if (!redirectUriMatches(q.redirect_uri, client.redirectUris)) {
+      return c.text("redirect_uri does not match the registered URIs", 400);
+    }
 
     // From here the redirect_uri is trusted, so errors go back to the client.
     const reject = (error: string, description: string) =>
@@ -297,14 +299,44 @@ async function issueTokens(cfg: Config, store: TokenStore, grant: RefreshGrant) 
 
 /** https, or http on loopback for local clients (OAuth 2.1 §4.1.3 / RFC 8252). */
 function isAllowedRedirectUri(uri: string): boolean {
-  let u: URL;
+  const u = parseUrl(uri);
+  if (!u) return false;
+  return u.protocol === "https:" || isLoopback(u);
+}
+
+function parseUrl(uri: string): URL | undefined {
   try {
-    u = new URL(uri);
+    return new URL(uri);
   } catch {
-    return false;
+    return undefined;
   }
-  if (u.protocol === "https:") return true;
+}
+
+function isLoopback(u: URL): boolean {
   return u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1" || u.hostname === "[::1]");
+}
+
+/**
+ * Exact match, except for loopback redirects: RFC 8252 §7.3 requires the authorization server to
+ * accept any port at request time, because a native client binds an ephemeral one and cannot know
+ * it when it registers. Everything else about the URI still has to match exactly.
+ */
+function redirectUriMatches(requested: string, registered: string[]): boolean {
+  if (registered.includes(requested)) return true;
+
+  const req = parseUrl(requested);
+  if (!req || !isLoopback(req)) return false;
+
+  return registered.some((candidate) => {
+    const reg = parseUrl(candidate);
+    return (
+      reg !== undefined &&
+      isLoopback(reg) &&
+      reg.hostname === req.hostname &&
+      reg.pathname === req.pathname &&
+      reg.search === req.search
+    );
+  });
 }
 
 function redirectWithParams(uri: string, params: Record<string, string | undefined>): string {

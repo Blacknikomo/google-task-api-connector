@@ -141,6 +141,35 @@ describe("OAuth authorization server", () => {
     }
   });
 
+  describe("loopback redirect URIs (RFC 8252)", () => {
+    const authorize = (clientId: string, redirectUri: string) =>
+      app.request(
+        `/oauth/authorize?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}` +
+          `&response_type=code&code_challenge=${CHALLENGE}&code_challenge_method=S256`,
+      );
+
+    it("accepts any port for a registered loopback callback", async () => {
+      // A native client binds an ephemeral port and cannot know it at registration time,
+      // so §7.3 requires the port to be ignored when matching.
+      const { body: client } = await register(app, ["http://127.0.0.1:1455/auth/callback"]);
+      const res = await authorize(client!.client_id, "http://127.0.0.1:52341/auth/callback");
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toContain("accounts.google.com");
+    });
+
+    it("still requires the rest of the loopback URI to match", async () => {
+      const { body: client } = await register(app, ["http://127.0.0.1:1455/auth/callback"]);
+      expect((await authorize(client!.client_id, "http://127.0.0.1:1455/evil")).status).toBe(400);
+      // localhost and 127.0.0.1 are distinct hosts, and the port rule must not leak to non-loopback.
+      expect((await authorize(client!.client_id, "http://localhost:1455/auth/callback")).status).toBe(400);
+    });
+
+    it("does not relax port matching for https redirects", async () => {
+      const { body: client } = await register(app, ["https://example.com:8443/cb"]);
+      expect((await authorize(client!.client_id, "https://example.com:9999/cb")).status).toBe(400);
+    });
+  });
+
   it("rejects a mismatched PKCE verifier", async () => {
     stubGoogle();
     const { body: client } = await register(app);
