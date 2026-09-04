@@ -28,27 +28,65 @@ describe("GoogleTasksClient", () => {
     expect(mock).toHaveBeenCalledTimes(2);
   });
 
-  it("widens due dates to cover the whole day and drops completed tasks", async () => {
+  it("matches a task due exactly on the queried day", async () => {
+    // Regression: this was delegated to Google's dueMin/dueMax. A task due on the same day sits
+    // exactly on the dueMin boundary, whose inclusivity Google does not document, so a
+    // single-day query could come back empty even though the task exists.
+    stub(() =>
+      json({
+        items: [
+          { id: "today", title: "due today", status: "needsAction", due: "2026-09-05T00:00:00.000Z" },
+          { id: "yesterday", title: "due yesterday", status: "needsAction", due: "2026-09-04T00:00:00.000Z" },
+          { id: "tomorrow", title: "due tomorrow", status: "needsAction", due: "2026-09-06T00:00:00.000Z" },
+          { id: "nodate", title: "no due date", status: "needsAction" },
+          { id: "done", title: "done today", status: "completed", due: "2026-09-05T00:00:00.000Z" },
+        ],
+      }),
+    );
+
+    const tasks = await new GoogleTasksClient("tok").listOpenTasks("list-1", {
+      dueMin: "2026-09-05",
+      dueMax: "2026-09-05",
+    });
+    expect(tasks.map((t) => t.id)).toEqual(["today"]);
+  });
+
+  it("does not filter by date when no range is given, and keeps undated tasks", async () => {
+    stub(() =>
+      json({
+        items: [
+          { id: "1", title: "dated", status: "needsAction", due: "2026-01-01T00:00:00.000Z" },
+          { id: "2", title: "undated", status: "needsAction" },
+          { id: "3", title: "done", status: "completed" },
+        ],
+      }),
+    );
+    const tasks = await new GoogleTasksClient("tok").listOpenTasks("list-1");
+    expect(tasks.map((t) => t.id)).toEqual(["1", "2"]);
+  });
+
+  it("treats an open-ended range as inclusive on the given side", async () => {
+    const items = [
+      { id: "a", title: "a", status: "needsAction", due: "2026-09-04T00:00:00.000Z" },
+      { id: "b", title: "b", status: "needsAction", due: "2026-09-05T00:00:00.000Z" },
+      { id: "c", title: "c", status: "needsAction", due: "2026-09-06T00:00:00.000Z" },
+    ];
+    stub(() => json({ items }));
+    const client = new GoogleTasksClient("tok");
+
+    expect((await client.listOpenTasks("l", { dueMin: "2026-09-05" })).map((t) => t.id)).toEqual(["b", "c"]);
+    expect((await client.listOpenTasks("l", { dueMax: "2026-09-05" })).map((t) => t.id)).toEqual(["a", "b"]);
+  });
+
+  it("asks Google only for open tasks and sets listId on every result", async () => {
     let seen: URL | undefined;
     stub((url) => {
       seen = url;
-      return json({
-        items: [
-          { id: "1", title: "open", status: "needsAction" },
-          { id: "2", title: "done", status: "completed" },
-        ],
-      });
+      return json({ items: [{ id: "1", title: "open", status: "needsAction" }] });
     });
-
-    const tasks = await new GoogleTasksClient("tok").listOpenTasks("list-1", {
-      dueMin: "2026-09-01",
-      dueMax: "2026-09-30",
-    });
-
-    expect(seen!.searchParams.get("dueMin")).toBe("2026-09-01T00:00:00.000Z");
-    expect(seen!.searchParams.get("dueMax")).toBe("2026-09-30T23:59:59.999Z");
+    const tasks = await new GoogleTasksClient("tok").listOpenTasks("list-1");
     expect(seen!.searchParams.get("showCompleted")).toBe("false");
-    expect(tasks.map((t) => t.id)).toEqual(["1"]);
+    expect(seen!.searchParams.get("showHidden")).toBe("false");
     expect(tasks[0].listId).toBe("list-1");
   });
 

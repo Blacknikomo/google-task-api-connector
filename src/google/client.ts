@@ -41,16 +41,20 @@ export class GoogleTasksClient {
 
   /** Open (needsAction) tasks in a list. Google returns max 100 per page; paginate. */
   async listOpenTasks(listId: string, opts: { dueMin?: string; dueMax?: string } = {}): Promise<Task[]> {
-    const query: Record<string, string> = {
+    // The due-date filter is applied here rather than by Google. `due` only ever holds a date at
+    // midnight UTC, so a task due on the same day as dueMin sits exactly ON the boundary, and
+    // Google does not document whether dueMin/dueMax are inclusive — a single-day query could
+    // silently return nothing. Filtering locally makes "on or after" / "on or before" exact, and
+    // costs no extra requests: find_tasks already reads every open task in a list.
+    const items = await this.paginate<ApiTask>(`/lists/${encodeURIComponent(listId)}/tasks`, {
       showCompleted: "false",
       showHidden: "false",
-    };
-    // Google expects RFC 3339 timestamps; widen a date to cover the whole day.
-    if (opts.dueMin) query.dueMin = `${opts.dueMin}T00:00:00.000Z`;
-    if (opts.dueMax) query.dueMax = `${opts.dueMax}T23:59:59.999Z`;
+    });
 
-    const items = await this.paginate<ApiTask>(`/lists/${encodeURIComponent(listId)}/tasks`, query);
-    return items.filter((t) => t.status !== "completed").map((t) => toTask(t, listId));
+    return items
+      .filter((t) => t.status !== "completed")
+      .map((t) => toTask(t, listId))
+      .filter((t) => dueWithin(t.due, opts.dueMin, opts.dueMax));
   }
 
   async createTask(task: NewTask & { listId: string }): Promise<Task> {
@@ -110,6 +114,19 @@ export class GoogleTasksClient {
     const text = await res.text();
     return (text ? JSON.parse(text) : undefined) as T;
   }
+}
+
+/**
+ * Inclusive date-range test on the calendar day of `due`. A task with no due date never matches a
+ * date-filtered query — "tasks due on 5 Sep" cannot mean "and also everything with no date".
+ */
+function dueWithin(due: string | undefined, min?: string, max?: string): boolean {
+  if (!min && !max) return true;
+  if (!due) return false;
+  const day = due.slice(0, 10); // YYYY-MM-DD; lexicographic order matches chronological order
+  if (min && day < min) return false;
+  if (max && day > max) return false;
+  return true;
 }
 
 function toTask(t: ApiTask, listId: string): Task {
