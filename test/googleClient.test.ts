@@ -78,6 +78,58 @@ describe("GoogleTasksClient", () => {
     expect((await client.listOpenTasks("l", { dueMax: "2026-09-05" })).map((t) => t.id)).toEqual(["a", "b"]);
   });
 
+  it("asks Google for hidden tasks when completed ones are wanted", async () => {
+    // Tasks ticked off in Google's own apps become hidden, so showCompleted alone returns nothing.
+    let seen: URL | undefined;
+    stub((url) => {
+      seen = url;
+      return json({ items: [{ id: "1", title: "done", status: "completed", completed: "2026-09-05T09:00:00.000Z" }] });
+    });
+
+    const { tasks } = await new GoogleTasksClient("tok").listTasks("list-1", { status: "completed" });
+    expect(seen!.searchParams.get("showCompleted")).toBe("true");
+    expect(seen!.searchParams.get("showHidden")).toBe("true");
+    expect(tasks.map((t) => t.id)).toEqual(["1"]);
+  });
+
+  it("separates open, completed and all", async () => {
+    const items = [
+      { id: "open", title: "open", status: "needsAction" },
+      { id: "done", title: "done", status: "completed", completed: "2026-09-05T09:00:00.000Z" },
+    ];
+    stub(() => json({ items }));
+    const client = new GoogleTasksClient("tok");
+
+    expect((await client.listTasks("l", { status: "open" })).tasks.map((t) => t.id)).toEqual(["open"]);
+    expect((await client.listTasks("l", { status: "completed" })).tasks.map((t) => t.id)).toEqual(["done"]);
+    expect((await client.listTasks("l", { status: "all" })).tasks.map((t) => t.id).sort()).toEqual(["done", "open"]);
+  });
+
+  it("filters completed tasks by the day they were completed", async () => {
+    stub(() =>
+      json({
+        items: [
+          { id: "today", title: "a", status: "completed", completed: "2026-09-05T23:30:00.000Z" },
+          { id: "yesterday", title: "b", status: "completed", completed: "2026-09-04T08:00:00.000Z" },
+        ],
+      }),
+    );
+
+    const { tasks } = await new GoogleTasksClient("tok").listTasks("l", {
+      status: "completed",
+      completedMin: "2026-09-05",
+      completedMax: "2026-09-05",
+    });
+    expect(tasks.map((t) => t.id)).toEqual(["today"]);
+  });
+
+  it("reports truncation instead of silently returning a partial list", async () => {
+    // Always hand back another page token so the page cap is what stops it.
+    stub(() => json({ items: [{ id: "x", title: "x", status: "needsAction" }], nextPageToken: "more" }));
+    const { truncated } = await new GoogleTasksClient("tok").listTasks("l");
+    expect(truncated).toBe(true);
+  });
+
   it("asks Google only for open tasks and sets listId on every result", async () => {
     let seen: URL | undefined;
     stub((url) => {
